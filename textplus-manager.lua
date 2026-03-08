@@ -1,27 +1,30 @@
 -- ================================================
--- TextPlus Manager
+-- Title Manager
 -- Part of PostFlows toolkit for DaVinci Resolve
 -- https://github.com/postflows
 -- ================================================
 
 --[[
-    TextPlus Manager Unified v03 for DaVinci Resolve
+    Title Manager v04 for DaVinci Resolve
 
     Copy style and transform text across Text+ clips or Fusion Macros on the timeline.
     Single-window interface, no tabs.
-
-    Version 02 Changes:
-    - Fixed issue with Macro/GroupOperator detection
-    - Improved textplus tool detection logic
-    - Added comprehensive debug output for troubleshooting
 
     Title Type
     - Text+: Standard Text+ titles. Copy full style (fast) or selected parameters
       (Font, Style, Size, Color, Tracking, Spacing, Layout). Transform text case
       and optionally remove punctuation.
     - Fusion Macros: MacroOperator/GroupOperator titles with published inputs.
-      Copy all published (Inspector) parameters between clips with the same name.
-      Text transform applies to published Styled Text and inner Text+ nodes.
+      Copy all published (Inspector) parameters, or choose which to copy via "Select Parameters…".
+      Same-structure check uses copyable inputs only (text inputs excluded). Text transform
+      applies to published Styled Text and inner Text+ nodes.
+
+    Fusion Macros — selective parameter copy
+    - "Select Parameters…" opens a parameter selector: tree of published inputs (labels and groups),
+      text-content inputs shown but not copyable. Click rows or group headers to toggle selection.
+    - Select All / Clear All / Invert; "Use Selection" saves choice and closes. Apply Style then
+      copies only selected parameters. If no selection was saved, all copyable parameters are copied.
+    
 
     Target selection (both modes)
     - Track: All, or a specific video track.
@@ -31,8 +34,9 @@
     Workflow
     1. Position playhead on the source clip.
     2. Click Refresh to load the active timeline (and when switching timelines).
-    3. Choose Title Type, Track, Clip Color, Style Copy, and Text Transform.
-    4. Apply Text Format Only, or Apply Style, to update target clips.
+    3. Choose Title Type (Text+ or Fusion Macros), Track, Clip Color; for Text+ choose Style Copy,
+      for Fusion Macros optionally click "Select Parameters…" to choose which parameters to copy.
+    4. Set Text Transform if needed, then Apply Text Format Only or Apply Style.
 
     Requirements: DaVinci Resolve Studio. Open project and timeline before use.
 ]]
@@ -338,6 +342,82 @@ local function get_published_inputs(comp)
     return inputs, op
 end
 
+-- Detailed published inputs for Fusion Macros: ordered list with kind (label/input), is_text, ctrl_group.
+-- Used for parameter selector UI and for same-structure check on copyable inputs only.
+local function get_published_inputs_detailed(comp)
+    if not comp then return {}, nil end
+    local op = find_macro_in_comp(comp)
+    if not op then return {}, nil end
+
+    local function is_text_content(id, name)
+        if id and id:lower():find("styledtext") then return true end
+        if name and name:lower():find("styled text") then return true end
+        local n = name and name:lower() or ""
+        if n == "text" or n == "title text" or n == "subtitle text" then return true end
+        return false
+    end
+
+    local raw = op:GetInputList()
+    local keys = {}
+    for k in pairs(raw) do
+        if type(k) == "number" then table.insert(keys, k) end
+    end
+    table.sort(keys)
+
+    local inputs = {}
+    for _, k in ipairs(keys) do
+        local obj = raw[k]
+        if not obj then goto cont end
+        local a = obj:GetAttrs()
+        local name = (a and a.INPS_Name) or "Unknown"
+        local id = (a and a.INPS_ID) or "Unknown"
+        local inp_ctrl = (a and a.INPID_InputControl) or ""
+        local ctrl_group = a and a.INPI_ControlGroup
+        local is_passive = a and a.INPB_Passive
+        local is_label = (inp_ctrl == "LabelControl")
+            or (is_passive and inp_ctrl == "" and ctrl_group == nil)
+
+        if is_label then
+            table.insert(inputs, { kind = "label", name = name, id = id })
+        else
+            local ok, val = pcall(function() return obj[comp.CurrentTime] end)
+            table.insert(inputs, {
+                kind = "input",
+                name = name,
+                id = id,
+                value = ok and val or nil,
+                obj = obj,
+                is_text = is_text_content(id, name),
+                ctrl_group = ctrl_group,
+            })
+        end
+        ::cont::
+    end
+    return inputs, op
+end
+
+-- Copyable = input entries that are not text content (for structure check and param list).
+local function copyable_inputs(descs)
+    local out = {}
+    for _, e in ipairs(descs or {}) do
+        if e.kind == "input" and not e.is_text then
+            table.insert(out, e)
+        end
+    end
+    return out
+end
+
+-- Same-structure check using only copyable inputs (labels excluded).
+local function same_structure_macro(a_descs, b_descs)
+    local a = copyable_inputs(a_descs)
+    local b = copyable_inputs(b_descs)
+    if #a ~= #b then return false end
+    local s = {}
+    for _, x in ipairs(a) do s[x.id] = true end
+    for _, x in ipairs(b) do if not s[x.id] then return false end end
+    return true
+end
+
 local function id_set(inp)
     local m = {}
     for _, x in ipairs(inp or {}) do if x.id then m[x.id] = true end end
@@ -453,12 +533,64 @@ local SECONDARY_BUTTON = string.format([[
     QPushButton:disabled { background-color: #666; color: #999; }
 ]], BORDER_COLOR, SECTION_BG, TEXT_COLOR)
 
+-- Same dimensions as SECONDARY_BUTTON but primary color (for dialog footer so both buttons match size)
+local PRIMARY_BUTTON_COMPACT = string.format([[
+    QPushButton { border: 1px solid %s; border-radius: 5px; background-color: %s; color: #FFF;
+        min-height: 30px; font-size: 12px; font-weight: bold; padding: 3px 10px; }
+    QPushButton:hover { background-color: %s; }
+    QPushButton:disabled { background-color: #666; border-color: #555; color: #999; }
+]], BORDER_COLOR, PRIMARY_COLOR, HOVER_COLOR)
+
 local SECTION = string.format([[ QLabel { color: %s; font-size: 14px; font-weight: bold; padding: 5px 0; } ]], TEXT_COLOR)
 local STATUS = [[ QLabel { color: #c0c0c0; font-size: 12px; padding: 3px 0; } ]]
 local COMBO = string.format([[
     QComboBox { border: 1px solid %s; border-radius: 4px; padding: 5px;
         background-color: %s; color: %s; min-height: 25px; }
 ]], BORDER_COLOR, SECTION_BG, TEXT_COLOR)
+
+-- Tree style for Fusion Macro parameter selector
+local TREE_STYLE = string.format([[
+    QTreeWidget {
+        background-color: #1e1e1e;
+        alternate-background-color: #232323;
+        border: 1px solid %s;
+        border-radius: 4px;
+        color: #ebebeb;
+        font-size: 12px;
+        outline: 0;
+    }
+    QTreeWidget::item            { height:26px; padding:0 4px; }
+    QTreeWidget::item:hover      { background:#2a3545; }
+    QTreeWidget::item:selected   { background:#1e1e1e; color:#ebebeb; }
+    QHeaderView::section {
+        background:#2A2A2A; color:#aaa; font-size:11px;
+        padding:3px 6px; border:none; border-bottom:1px solid %s;
+    }
+]], BORDER_COLOR, BORDER_COLOR)
+
+local function fmt_macro_value(v)
+    if v == nil then return "—" end
+    local t = type(v)
+    if t == "number" then
+        if math.floor(v) == v then return tostring(math.floor(v)) end
+        return string.format("%.3g", v)
+    elseif t == "string" then
+        if #v > 22 then return v:sub(1, 20) .. "…" else return v end
+    elseif t == "boolean" then
+        return v and "true" or "false"
+    elseif t == "table" then
+        local keys = {}
+        for k in pairs(v) do table.insert(keys, k) end
+        table.sort(keys)
+        local parts = {}
+        for _, k in ipairs(keys) do
+            local val = v[k]
+            if type(val) == "number" then table.insert(parts, string.format("%.2g", val)) end
+        end
+        return #parts > 0 and ("{" .. table.concat(parts, ", ") .. "}") or "{…}"
+    end
+    return tostring(v)
+end
 
 -- Parameter groups reference for Text+ node (accurate, extracted from macro settings)
 local PARAM_GROUPS = {
@@ -643,12 +775,12 @@ end
 
 win = disp:AddWindow({
     ID = "UnifiedWin",
-    WindowTitle = "TextPlus Manager",
+    WindowTitle = "Title Manager",
     Geometry = {300, 300, 530, 560},
     Spacing = 8,
 
     ui:VGroup{
-        ui:Label{ Text = "TextPlus Manager", StyleSheet = SECTION },
+        ui:Label{ Text = "Title Manager", StyleSheet = SECTION },
         ui:VGap(4),
 
         ui:Label{ Text = "Title Type", StyleSheet = SECTION },
@@ -667,8 +799,12 @@ win = disp:AddWindow({
 
         ui:VGap(8),
 
-        ui:Label{ Text = "Style Copy", StyleSheet = SECTION },
-        ui:ComboBox{ ID = "StyleCopy", Weight = 1, StyleSheet = COMBO },
+        -- Text+ mode: Style Copy (Full Style / Selected Parameters)
+        ui:VGroup{
+            ID = "StyleCopyGroup",
+            ui:Label{ Text = "Style Copy", StyleSheet = SECTION },
+            ui:ComboBox{ ID = "StyleCopy", Weight = 1, StyleSheet = COMBO },
+        },
         ui:VGroup{
             ID = "ParamsGroup",
             Hidden = true,
@@ -748,6 +884,14 @@ win = disp:AddWindow({
                 }
             }
         },
+        -- Fusion Macros mode: choose which parameters to copy
+        ui:VGroup{
+            ID = "MacroParamsGroup",
+            Hidden = true,
+            ui:Label{ Text = "Copy parameters", StyleSheet = SECTION },
+            ui:Label{ ID = "MacroParamsHint", Text = "Choose which macro parameters to copy (default: all).", StyleSheet = STATUS },
+            ui:Button{ ID = "MacroSelectParams", Text = "Select Parameters…", StyleSheet = SECONDARY_BUTTON }
+        },
 
         ui:VGap(8),
 
@@ -816,6 +960,11 @@ itm.TextTransform:AddItem("Capitalize First Letter")
 itm.TextTransform:AddItem("Capitalize All Words")
 
 local has_refreshed = false
+
+-- Fusion Macros: selected parameter IDs for selective copy (id -> true). Empty means "copy all copyable".
+local macro_selected_ids = {}
+local macro_param_win = nil
+local macro_param_disp = nil
 
 local function track_filter_value()
     local t = itm.TrackCombo.CurrentText
@@ -896,24 +1045,49 @@ local function update_subgroups_visibility()
     end
 end
 
+local last_fusion_mode = nil  -- track previous mode to detect switches
+
 local function update_style_copy_state()
     local fusion = is_fusion_mode()
-    itm.StyleCopy.Enabled = not fusion
+    local mode_switched = (last_fusion_mode ~= nil) and (last_fusion_mode ~= fusion)
+    last_fusion_mode = fusion
+
+    -- Title Type must always be switchable (Text+ <-> Fusion Macros)
+    if itm.TitleType then
+        itm.TitleType.Enabled = true
+    end
+
+    -- Text+ mode: show Style Copy (Full Style / Selected Parameters)
+    -- Fusion mode: hide Style Copy, show "Copy parameters" block with Select Parameters button
+    if itm.StyleCopyGroup then
+        itm.StyleCopyGroup.Hidden = fusion
+    end
+    if itm.MacroParamsGroup then
+        itm.MacroParamsGroup.Hidden = not fusion
+        if itm.MacroSelectParams then
+            itm.MacroSelectParams.Enabled = fusion and has_refreshed
+        end
+    end
+
     local show_params = not fusion and (itm.StyleCopy.CurrentText == "Selected Parameters")
     local was_visible = not itm.ParamsGroup.Hidden
     itm.ParamsGroup.Hidden = not show_params
-    
+
     if show_params and not was_visible then
         resize_window(200)
-        -- Call update_subgroups_visibility after ParamsGroup is shown
         update_subgroups_visibility()
-        win:RecalcLayout()
-        win:Update()
     elseif not show_params and was_visible then
         resize_window(-200)
     end
+
+    -- Always recalculate layout on mode switch so widgets don't end up in wrong positions
+    if mode_switched then
+        win:RecalcLayout()
+        win:Update()
+    end
+
     if fusion then
-        itm.Status.Text = "Fusion Macros: copy all published inputs; Style Copy disabled."
+        itm.Status.Text = "Fusion Macros: copy all published inputs, or choose parameters via Select Parameters…"
     end
 end
 
@@ -971,6 +1145,277 @@ local function get_targets_fusion()
     local all = find_fusion_macro_clips()
     all = filter_fusion_same_name(all, name)
     return filter_by_track_color(all, track_filter_value(), color_filter_value(), true)
+end
+
+local function close_macro_param_win()
+    if macro_param_win then
+        pcall(function() macro_param_win:Hide() end)
+        macro_param_win = nil
+        macro_param_disp = nil
+    end
+end
+
+-- Open Fusion Macro parameter selector; saves selection to macro_selected_ids on Use Selection / Close.
+local function open_macro_param_selector()
+    local src = ctx.timeline:GetCurrentVideoItem()
+    if not src then
+        itm.Status.Text = "No clip under playhead."
+        return
+    end
+    local comp = get_fusion_comp_from_clip(src)
+    if not comp or not find_macro_in_comp(comp) then
+        itm.Status.Text = "Clip under playhead is not a Fusion macro."
+        return
+    end
+    local descs = get_published_inputs_detailed(comp)
+    local copyable = copyable_inputs(descs)
+    if #copyable == 0 then
+        itm.Status.Text = "Macro has no published (copyable) inputs."
+        return
+    end
+    local targets = get_targets_fusion()
+    local n_copyable = #copyable
+
+    local sel = {}
+    for _, e in ipairs(copyable) do
+        sel[e.id] = (macro_selected_ids[e.id] == true)
+    end
+    -- If no selection yet, default all to true (copy all)
+    local any_sel = false
+    for _ in pairs(macro_selected_ids) do any_sel = true; break end
+    if not any_sel then
+        for _, e in ipairs(copyable) do sel[e.id] = true end
+    end
+
+    close_macro_param_win()
+    local pdisp = bmd.UIDispatcher(ui)
+    local pwin = pdisp:AddWindow({
+        ID = "MacroParamSel",
+        WindowTitle = "Fusion Macro Parameters — " .. src:GetName(),
+        Geometry = { 800, 60, 580, 640 },
+        Spacing = 6,
+        ui:VGroup{
+            ui:VGroup{
+                Weight = 0,
+                ui:Label{
+                    Text = string.format(
+                        "%d parameters  |  %d target clip(s)  |  click row or group header to toggle",
+                        n_copyable, #targets),
+                    StyleSheet = STATUS
+                },
+                ui:HGroup{
+                    Weight = 0, Spacing = 4,
+                    ui:Button{ ID = "PSelectAll", Text = "Select All", MinimumSize = {88, 26}, MaximumSize = {9999, 26}, StyleSheet = SECONDARY_BUTTON },
+                    ui:Button{ ID = "PClearAll",  Text = "Clear All",  MinimumSize = {88, 26}, MaximumSize = {9999, 26}, StyleSheet = SECONDARY_BUTTON },
+                    ui:Button{ ID = "PInvert",   Text = "Invert",     MinimumSize = {72, 26}, MaximumSize = {9999, 26}, StyleSheet = SECONDARY_BUTTON },
+                    ui:HGap(0)
+                },
+                ui:VGap(4),
+            },
+            ui:Tree{
+                ID = "ParamTree",
+                Weight = 1,
+                SortingEnabled = false,
+                AlternatingRowColors = false,
+                RootIsDecorated = false,
+                SelectionMode = "NoSelection",
+                StyleSheet = TREE_STYLE,
+                ColumnCount = 3,
+                ColumnHeaders = { "", "Parameter", "Value" },
+            },
+            ui:VGroup{
+                Weight = 0,
+                ui:VGap(4),
+                ui:Label{ ID = "PSelCount", Text = "0 of " .. n_copyable .. " selected", StyleSheet = STATUS, Alignment = { AlignCenter = true }, MaximumSize = {9999, 18} },
+                ui:HGroup{
+                    Weight = 0,
+                    ui:Button{ ID = "PClose", Text = "Close", MinimumSize = {100, 32}, MaximumSize = {9999, 32}, StyleSheet = SECONDARY_BUTTON },
+                    ui:Button{ ID = "PUseSel", Text = "Use Selection", MinimumSize = {120, 32}, MaximumSize = {9999, 32}, StyleSheet = PRIMARY_BUTTON_COMPACT }
+                },
+            }
+        }
+    })
+
+    local pitm = pwin:GetItems()
+    local tree = pitm.ParamTree
+    tree:SetColumnWidth(0, 26)
+    tree:SetColumnWidth(1, 310)
+    tree:SetColumnWidth(2, 180)
+
+    local row_map = {}
+    local tree_items = {}
+    local label_groups = {}
+    local current_group = nil
+    local row_idx = 0
+
+    local function style_label_row(row, grp)
+        local total = #grp.members
+        local n_sel = 0
+        for _, ti in ipairs(grp.members) do
+            if sel[ti.id] then n_sel = n_sel + 1 end
+        end
+        local indicator = (total > 0 and n_sel == total) and "[✓]" or (n_sel > 0) and "[-]" or "[ ]"
+        row:SetText(0, indicator)
+        pcall(function()
+            row:SetForeground(0, 0x66, 0x99, 0xcc, 0xff)
+            row:SetForeground(1, 0x88, 0xbb, 0xff, 0xff)
+            row:SetForeground(2, 0x44, 0x66, 0x88, 0xff)
+            row:SetBackground(0, 0x28, 0x30, 0x3e, 0xff)
+            row:SetBackground(1, 0x28, 0x30, 0x3e, 0xff)
+            row:SetBackground(2, 0x28, 0x30, 0x3e, 0xff)
+        end)
+    end
+
+    for _, desc in ipairs(descs) do
+        local row = tree:NewItem()
+        if desc.kind == "label" then
+            current_group = { label_item = row, members = {} }
+            table.insert(label_groups, current_group)
+            row:SetText(1, "▸  " .. desc.name)
+            row:SetText(2, "")
+            style_label_row(row, current_group)
+            tree:AddTopLevelItem(row)
+            row_map[row_idx] = { kind = "label", group_idx = #label_groups }
+        elseif desc.kind == "input" then
+            if desc.is_text then
+                row:SetText(0, "")
+                row:SetText(1, "    " .. desc.name)
+                row:SetText(2, "(text — not copyable)")
+                pcall(function()
+                    row:SetForeground(0, 0x44, 0x44, 0x44, 0xff)
+                    row:SetForeground(1, 0x55, 0x55, 0x55, 0xff)
+                    row:SetForeground(2, 0x44, 0x44, 0x44, 0xff)
+                end)
+                tree:AddTopLevelItem(row)
+                row_map[row_idx] = { kind = "text" }
+            else
+                row:SetText(0, sel[desc.id] and "●" or "○")
+                row:SetText(1, "    " .. desc.name)
+                row:SetText(2, fmt_macro_value(desc.value))
+                pcall(function()
+                    local r, g, b = sel[desc.id] and 0x4c or 0x88, sel[desc.id] and 0x95 or 0x88, sel[desc.id] and 0x6c or 0x88
+                    row:SetForeground(0, r, g, b, 0xff)
+                end)
+                tree:AddTopLevelItem(row)
+                local ti = { item = row, id = desc.id }
+                table.insert(tree_items, ti)
+                if current_group then table.insert(current_group.members, ti) end
+                row_map[row_idx] = { kind = "input", ti_idx = #tree_items }
+            end
+        end
+        row_idx = row_idx + 1
+    end
+
+    local function count_sel()
+        local n = 0
+        for _, ti in ipairs(tree_items) do if sel[ti.id] then n = n + 1 end end
+        return n
+    end
+
+    local function update_ui()
+        pitm.PSelCount.Text = string.format("%d of %d selected", count_sel(), n_copyable)
+    end
+
+    local function set_item(ti, new_state)
+        sel[ti.id] = new_state
+        ti.item:SetText(0, new_state and "●" or "○")
+        pcall(function()
+            local r, g, b = new_state and 0x4c or 0x88, new_state and 0x95 or 0x88, new_state and 0x6c or 0x88
+            ti.item:SetForeground(0, r, g, b, 0xff)
+        end)
+    end
+
+    local function refresh_label(grp)
+        if grp and grp.label_item then style_label_row(grp.label_item, grp) end
+    end
+
+    local function toggle_group(grp)
+        if #grp.members == 0 then return end
+        local all_on = true
+        for _, ti in ipairs(grp.members) do
+            if not sel[ti.id] then all_on = false; break end
+        end
+        local new_state = not all_on
+        for _, ti in ipairs(grp.members) do set_item(ti, new_state) end
+        refresh_label(grp)
+        update_ui()
+    end
+
+    local function get_row_idx(clicked_item)
+        local n = tree:TopLevelItemCount()
+        for i = 0, n - 1 do
+            if tree:TopLevelItem(i) == clicked_item then return i end
+        end
+        return nil
+    end
+
+    local function find_group_for_ti(ti_idx)
+        local ti = tree_items[ti_idx]
+        for _, grp in ipairs(label_groups) do
+            for _, m in ipairs(grp.members) do
+                if m.id == ti.id then return grp end
+            end
+        end
+        return nil
+    end
+
+    update_ui()
+
+    pwin.On.ParamTree.ItemClicked = function(ev)
+        local clicked_row = get_row_idx(ev.item)
+        if clicked_row == nil then return end
+        local entry = row_map[clicked_row]
+        if not entry then return end
+        if entry.kind == "label" then
+            toggle_group(label_groups[entry.group_idx])
+            return
+        end
+        if entry.kind ~= "input" then return end
+        local ti = tree_items[entry.ti_idx]
+        set_item(ti, not sel[ti.id])
+        refresh_label(find_group_for_ti(entry.ti_idx))
+        update_ui()
+    end
+
+    local function refresh_all_labels()
+        for _, grp in ipairs(label_groups) do refresh_label(grp) end
+    end
+
+    pwin.On.PSelectAll.Clicked = function(ev)
+        for _, ti in ipairs(tree_items) do set_item(ti, true) end
+        refresh_all_labels()
+        update_ui()
+    end
+
+    pwin.On.PClearAll.Clicked = function(ev)
+        for _, ti in ipairs(tree_items) do set_item(ti, false) end
+        refresh_all_labels()
+        update_ui()
+    end
+
+    pwin.On.PInvert.Clicked = function(ev)
+        for _, ti in ipairs(tree_items) do set_item(ti, not sel[ti.id]) end
+        refresh_all_labels()
+        update_ui()
+    end
+
+    local function save_sel()
+        macro_selected_ids = {}
+        for _, ti in ipairs(tree_items) do
+            macro_selected_ids[ti.id] = sel[ti.id]
+        end
+    end
+
+    pwin.On.PClose.Clicked = function(ev) save_sel(); pdisp:ExitLoop() end
+    pwin.On.PUseSel.Clicked = function(ev) save_sel(); pdisp:ExitLoop() end
+    pwin.On.MacroParamSel.Close = function(ev) save_sel(); pdisp:ExitLoop() end
+
+    macro_param_win = pwin
+    macro_param_disp = pdisp
+    pwin:Show()
+    pdisp:RunLoop()
+    pwin:Hide()
+    close_macro_param_win()
 end
 
 -- DEBUG_MODE and debug_print are now defined at the top of the file
@@ -1136,7 +1581,12 @@ local function selected_params_list()
 end
 
 function win.On.UnifiedWin.Close(ev)
+    close_macro_param_win()
     disp:ExitLoop()
+end
+
+function win.On.MacroSelectParams.Clicked(ev)
+    open_macro_param_selector()
 end
 
 function win.On.TitleType.CurrentIndexChanged(ev)
@@ -1351,31 +1801,75 @@ function win.On.ApplyStyle.Clicked(ev)
             itm.ApplyTextOnly.Enabled = true
             return
         end
-        local src_in, _ = get_published_inputs(comp)
-        if #src_in == 0 then
-            itm.Status.Text = "Source has no MacroOperator/GroupOperator or no published inputs."
+        local src_descs, src_op = get_published_inputs_detailed(comp)
+        local copyable = copyable_inputs(src_descs)
+        if #copyable == 0 then
+            itm.Status.Text = "Source has no MacroOperator/GroupOperator or no published (copyable) inputs."
             itm.ApplyStyle.Enabled = true
             itm.ApplyTextOnly.Enabled = true
             return
         end
 
+        -- Determine which parameter IDs to copy: selected only (if user ever used Select Parameters),
+        -- or all copyable when no selection was saved.
+        local ids_to_copy = {}
+        local has_saved_selection = false
+        for _ in pairs(macro_selected_ids) do has_saved_selection = true; break end
+        if has_saved_selection then
+            for _, e in ipairs(copyable) do
+                if macro_selected_ids[e.id] == true then
+                    ids_to_copy[e.id] = true
+                end
+            end
+        else
+            for _, e in ipairs(copyable) do
+                ids_to_copy[e.id] = true
+            end
+        end
+
+        local n_ids = 0
+        for _ in pairs(ids_to_copy) do n_ids = n_ids + 1 end
+        if n_ids == 0 then
+            itm.Status.Text = "No parameters to copy. Use Select Parameters… and choose at least one, or clear selection to copy all."
+            itm.ApplyStyle.Enabled = true
+            itm.ApplyTextOnly.Enabled = true
+            return
+        end
+
+        -- Build source values by id from source op
+        local src_vals = {}
+        for _, obj in pairs(src_op:GetInputList()) do
+            local a = obj:GetAttrs()
+            local id = a and a.INPS_ID
+            if id and ids_to_copy[id] then
+                local ok, val = pcall(function() return obj[comp.CurrentTime] end)
+                src_vals[id] = ok and val or nil
+            end
+        end
+
         for i, e in ipairs(targets) do
             local tc = e.comp or get_fusion_comp_from_clip(e.clip)
             if tc then
-                local tgt_in, _ = get_published_inputs(tc)
-                if same_structure(src_in, tgt_in) then
-                    local by_id = {}
-                    for _, x in ipairs(tgt_in) do by_id[x.id] = x end
-                    for _, s in ipairs(src_in) do
-                        local t = by_id[s.id]
-                        if t and t.obj then
-                            pcall(function() t.obj[tc.CurrentTime] = s.value end)
+                local tgt_descs, tgt_op = get_published_inputs_detailed(tc)
+                if same_structure_macro(src_descs, tgt_descs) and tgt_op then
+                    local tgt_map = {}
+                    for _, obj in pairs(tgt_op:GetInputList()) do
+                        local a = obj:GetAttrs()
+                        local id = a and a.INPS_ID
+                        if id then tgt_map[id] = obj end
+                    end
+                    local any = false
+                    for id, val in pairs(src_vals) do
+                        local tobj = tgt_map[id]
+                        if tobj and val ~= nil then
+                            pcall(function() tobj[tc.CurrentTime] = val end)
+                            any = true
                         end
                     end
+                    if any then ok_count = ok_count + 1 end
                     if needTransform then
                         apply_transform_macro(tc, transform, punct)
                     end
-                    ok_count = ok_count + 1
                 end
             end
             if ENABLE_PROGRESS and i % 5 == 0 then
